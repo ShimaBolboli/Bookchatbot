@@ -1,28 +1,28 @@
 import streamlit as st
 import os
 import pandas as pd
-import numpy as np
-import asyncio
-from transformers import AutoTokenizer, AutoModel
 from pinecone import Pinecone, ServerlessSpec
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from transformers import pipeline
 from tqdm import tqdm
-from langchain.langchain import LangChain, Pipe
-from langchain.helpers import wrap_transformer, PineconeEmbedding
+import torch
 
 # Initialize Pinecone
 os.environ["PINECONE_API_KEY"] = '915e4017-1821-4418-b008-cff4b15b7677'
-os.environ["PINECONE_ENVIRONMENT"] = 'us-east-1'
+os.environ["PINECONE_ENVIRONMENT"] = 'YOUR_PINECONE_ENVIRONMENT'
 api_key = os.getenv("PINECONE_API_KEY")
 valid_environment = os.getenv("PINECONE_ENVIRONMENT")
+
 pc = Pinecone(api_key=api_key, environment=valid_environment)
 
 # Set index details
 index_name = 'books'
 dimension = 384
+text_key = 'title'
+authors_key = 'authors'
 
 # Check if index already exists
-indexes = pc.list_indexes()
-if index_name not in indexes.names():
+if index_name not in pc.list_indexes().names():
     # Create the index if it doesn't exist
     pc.create_index(
         name=index_name,
@@ -30,12 +30,17 @@ if index_name not in indexes.names():
         metric='cosine',  # Adjust metric as needed
         spec=ServerlessSpec(cloud='aws', region='us-east-1')
     )
+ 
 
 # Connect to the index
 index = pc.Index(index_name)
 
-# Load your dataset
+print ('sdsfsdfs',index)
+
+# Load your dataset with proper handling of NaN values
 df = pd.read_csv('books.csv')
+print("Dataset shape:", df.shape)  # Log the shape of the dataset
+print("Dataset head:\n", df.head())  # Log the first few rows for column inspection
 
 # Clean and preprocess the dataset
 df = df.dropna(subset=['title', 'authors'])  # Drop rows where 'title' or 'authors' are NaN
@@ -43,81 +48,147 @@ df['title'] = df['title'].astype(str)
 df['authors'] = df['authors'].astype(str)
 df['bookID'] = df['bookID'].astype(str)  # Ensure bookID is a string
 
+
 # Initialize Hugging Face model for sentence embeddings
 model_name = "sentence-transformers/all-MiniLM-L6-v2"  # Example model, replace with appropriate Hugging Face model
-tokenizer = AutoTokenizer.from_pretrained(model_name)
-model = AutoModel.from_pretrained(model_name)
+model_kwargs = {'device': 'cpu'}  # Set device to 'cuda' if GPU is available
+encode_kwargs = {'normalize_embeddings': False}
+embedding_model = HuggingFaceEmbeddings(model_name=model_name,
+                                       model_kwargs=model_kwargs,
+                                       encode_kwargs=encode_kwargs)
 
-# Initialize LangChain
-lc = LangChain()
+# Initialize Hugging Face model for text generation
+generator = pipeline("text-generation", model="distilgpt2", tokenizer="distilgpt2", device=0 if model_kwargs['device'] == 'cuda' else -1)  # Example generation model, set device accordingly
 
-# Define pipeline for embedding and upserting
-@lc.Pipe
-def embed_and_upsert(data):
-    embeddings = []
-    for item in data:
-        title_embedding = tokenizer(item['title'], return_tensors="pt")['input_ids']
-        with torch.no_grad():
-            title_embedding = model(title_embedding).last_hidden_state.mean(dim=1)
-        embeddings.append(title_embedding.tolist())
-    vectors = np.array(embeddings).astype(np.float32)
-    ids = [item['bookID'] for item in data]
-    meta = [{'title': item['title'], 'authors': item['authors']} for item in data]
-    return {'ids': ids, 'vectors': vectors, 'meta': meta}
+# Initialize summarization pipeline
+summarizer = pipeline(
+    "summarization",
+    model="pszemraj/long-t5-tglobal-base-16384-book-summary",
+    device=0 if torch.cuda.is_available() else -1,
+)
 
-# Function to fetch top-k entries from Pinecone using a vector
-async def fetch_top_k_entries(query_vector, k=3):
+# Function to upsert data into Pinecone
+def upsert_data():
     try:
+        batch_size = 50
+        vectors = []
+        for start_idx in tqdm(range(0, len(df), batch_size), desc="Upserting batches"):
+            end_idx = min(start_idx + batch_size, len(df))
+            batch_texts = df[['title', 'authors']].iloc[start_idx:end_idx].astype(str).apply(lambda x: ' '.join(x), axis=1)
+            batch_ids = df['bookID'].iloc[start_idx:end_idx].astype(str)
+            batch_meta = df[['bookID', 'title', 'authors']].iloc[start_idx:end_idx].apply(lambda x: x.to_dict(), axis=1).tolist()
+
+            # Embed batch texts
+            batch_embeddings = embedding_model.embed_documents(batch_texts.tolist())
+            
+            for id, embedding, metadata in zip(batch_ids, batch_embeddings, batch_meta):
+                vectors.append({
+                    'id': str(id),
+                    'values': embedding,
+                    'metadata': metadata
+                })
+
+        if vectors:
+            index.upsert(vectors=vectors)
+            print(f"Data upserted to Pinecone. {len(vectors)} vectors processed.")
+        else:
+            print("No vectors to upsert.")
+    
+    except Exception as e:
+        print(f"Error upserting data to Pinecone: {e}")
+upsert_data()  # Ensure data is upserted before running the Streamlit app
+
+
+def fetch_top_k_entries(query_text, k=3, threshold=0.5):
+    try:
+        # Embed the query text using Hugging Face model
+        query_embedding = embedding_model.embed_documents([query_text])[0]
+
         # Query Pinecone index
-        result = index.query(queries=[query_vector], top_k=k, include_metadata=True)
+        result = index.query(vector=query_embedding, top_k=k, include_metadata=True)
 
-        top_k_entries = []
-        for match in result['matches']:
-            title = match['metadata']['title']
-            authors = match['metadata']['authors']
-            top_k_entries.append({
-                'title': title,
-                'authors': authors
-            })
+        if result and 'matches' in result and len(result['matches']) > 0:
+            all_results = []
+            for match in result['matches']:
+                title = match['metadata'].get(text_key, 'No title found')
+                authors = match['metadata'].get(authors_key, 'No authors found')
 
-        return top_k_entries
+                # Check if the query_text matches title or authors
+                if query_text.lower() in title.lower() or query_text.lower() in authors.lower():
+                    all_results.append({
+                        'title': title,
+                        'authors': authors,
+                        'metadata': match['metadata']
+                    })
+                else:
+                    # Check for partial matching in authors
+                    query_authors = query_text.lower().split()  # Split query authors by spaces
+                    match_authors = authors.lower().split()  # Split matched authors by spaces
+                    if all(query_author in match_authors for query_author in query_authors):
+                        all_results.append({
+                            'title': title,
+                            'authors': authors,
+                            'metadata': match['metadata']
+                        })
+
+            if all_results:
+                return all_results
+            else:
+                return None  # Return None when no exact or partial matches found
+        else:
+            return None  # Return None when no results found
 
     except Exception as e:
-        print(f"Pinecone API Exception: {e}")
-        return []
+        print(f"Error during fetching top-k entries: {e}")
+        return None
 
-# Async wrapper function
-async def process_query(query):
-    # Embed the query using Hugging Face model
-    query_embedding = tokenizer(query, return_tensors="pt")['input_ids']
-    with torch.no_grad():
-        query_embedding = model(query_embedding).last_hidden_state.mean(dim=1).numpy()
 
-    # Fetch top-k entries
-    results = await fetch_top_k_entries(query_embedding)
-    return results
 
-# Streamlit UI
-st.title('Book Recommendation Chatbot')
+def main():
+    st.title("🦜🔗Book Recommendation Chatbot")
 
-query = st.text_input('Enter your query:', '')
+    if 'history' not in st.session_state:
+        st.session_state['history'] = []
 
-if st.button('Search'):
-    if query:
-        st.write(f'Query Entered: {query}')
-        
-        # Display a placeholder for results
-        result_placeholder = st.empty()
-        result_placeholder.text("Searching for recommendations...")
-
-        # Run async wrapper function using asyncio.run()
-        results = asyncio.run(process_query(query))
-
+    query_text = st.text_input("Enter your query:", key="query")
+    k = 3
+    if st.button("Get Recommendations"):
+        results = fetch_top_k_entries(query_text, k)
         if results:
-            result_placeholder.empty()
-            st.write("Top Recommendations:")
-            for result in results:
-                st.write(f"- Title: {result['title']}, Authors: {result['authors']}")
+            st.session_state['history'].append({
+                'query': query_text,
+                'results': results
+            })
         else:
-            result_placeholder.empty()
-            st.write("Sorry, no relevant recommendations found for your query.")
+            st.session_state['history'].append({
+                'query': query_text,
+                'results': "No data found about it."
+            })
+
+    if st.session_state['history']:
+        for session in reversed(st.session_state['history']):
+            if session['results'] == "No data found about it.":
+                st.markdown(f"🤖 **Chatbot:** No data found about '{session['query']}'")
+            else:
+                for result in session['results']:
+                    if 'metadata' in result and 'title' in result['metadata'] and 'authors' in result['metadata']:
+                        title_and_authors = result['metadata']['title'] + " by " + result['metadata']['authors']
+                        params = {
+                            "max_length": 256,
+                            "min_length": 8,
+                            "no_repeat_ngram_size": 3,
+                            "early_stopping": True,
+                            "repetition_penalty": 3.5,
+                            "length_penalty": 0.3,
+                            "encoder_no_repeat_ngram_size": 3,
+                            "num_beams": 4,
+                        }
+                        summarized_result = summarizer(title_and_authors, **params)
+                        if summarized_result:
+                            st.markdown(f"📝 **User:** {session['query']}")
+                            st.markdown(f"🤖  **Title:** {result['title']}, **Authors:** {result['authors']}")
+                           
+                            st.markdown("---")
+
+if __name__ == "__main__":
+   main()
