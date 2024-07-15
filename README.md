@@ -46,7 +46,8 @@ export PINECONE_ENVIRONMENT='your_pinecone_environment'
 -------------------------------------------------
 ***Usage***
 
-1- Ensure your dataset (books.csv) is in the project directory.
+1- Ensure your dataset (For example books.csv) is in the project directory.
+you can download dataset from website like Kaggle 
 
 2- Run the Streamlit app:
 
