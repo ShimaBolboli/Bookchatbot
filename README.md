@@ -75,6 +75,11 @@ Fetching and Displaying Recommendations:
 
 User queries are embedded using the same Hugging Face model, and the top-k matches are retrieved from the Pinecone index. The results are filtered for exact and partial matches to ensure relevant recommendations.
 
+
+***YouTube link***
+-----------------------------------
+https://youtu.be/zfCmMzZ4JaQ
+
 Streamlit Interface:
 
 Streamlit is used to create a web interface for the chatbot. Users can input queries and view recommendations. The interface maintains a history of user interactions, displaying previous queries and their corresponding results.
