@@ -35,12 +35,8 @@ if index_name not in pc.list_indexes().names():
 # Connect to the index
 index = pc.Index(index_name)
 
-print ('sdsfsdfs',index)
-
 # Load your dataset with proper handling of NaN values
 df = pd.read_csv('books.csv')
-print("Dataset shape:", df.shape)  # Log the shape of the dataset
-print("Dataset head:\n", df.head())  # Log the first few rows for column inspection
 
 # Clean and preprocess the dataset
 df = df.dropna(subset=['title', 'authors'])  # Drop rows where 'title' or 'authors' are NaN
