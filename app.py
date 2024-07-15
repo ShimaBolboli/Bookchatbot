@@ -8,7 +8,7 @@ from tqdm import tqdm
 import torch
 
 # Initialize Pinecone
-os.environ["PINECONE_API_KEY"] = '915e4017-1821-4418-b008-cff4b15b7677'
+os.environ["PINECONE_API_KEY"] =  '********-****-****-****-************' 
 os.environ["PINECONE_ENVIRONMENT"] = 'YOUR_PINECONE_ENVIRONMENT'
 api_key = os.getenv("PINECONE_API_KEY")
 valid_environment = os.getenv("PINECONE_ENVIRONMENT")
